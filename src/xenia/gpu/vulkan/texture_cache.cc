@@ -358,6 +358,11 @@ TextureCache::Texture* TextureCache::AllocateTexture(
 
   TextureRegion* base_region = AllocateTextureRegion(
       texture, region_offset, region_extent, required_flags);
+  if (!base_region) {
+    delete texture;
+    return nullptr;
+  }
+
   texture->base_region = base_region;
   return texture;
 }
@@ -515,7 +520,7 @@ TextureCache::TextureRegion* TextureCache::DemandRegion(
           VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
     }
 
-    if (command_buffer && !region->region_contents_valid) {
+    if (command_buffer && region && !region->region_contents_valid) {
       // Region content is out-of-date, recreate it by blitting from the base
       // region.
 

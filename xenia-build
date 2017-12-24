@@ -215,14 +215,14 @@ def get_git_head_info():
         'HEAD',
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     (stdout, stderr) = p.communicate()
-    branch_name = stdout.strip() or 'detached'
+    branch_name = stdout.decode('ascii').strip() or 'detached'
     p = subprocess.Popen([
         'git',
         'rev-parse',
         'HEAD',
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     (stdout, stderr) = p.communicate()
-    commit = stdout.strip() or 'unknown'
+    commit = stdout.decode('ascii').strip() or 'unknown'
     p = subprocess.Popen([
         'git',
         'rev-parse',
@@ -230,7 +230,7 @@ def get_git_head_info():
         'HEAD',
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     (stdout, stderr) = p.communicate()
-    commit_short = stdout.strip() or 'unknown'
+    commit_short = stdout.decode('ascii').strip() or 'unknown'
     return branch_name, commit, commit_short
 
 
@@ -576,12 +576,18 @@ class BaseBuildCommand(Command):
         self.parser.add_argument(
             '--no_premake', action='store_true',
             help='Skips running premake before building.')
+        self.parser.add_argument(
+            '-j', default=0, type=int, help='Number of parallel threads')
 
     def execute(self, args, pass_args, cwd):
         if not args['no_premake']:
             print('- running premake...')
             run_platform_premake()
             print('')
+
+        threads = args['j']
+        if threads < 0:
+            threads = 0
 
         print('- building (%s):%s...' % (
             'all' if not len(args['target']) else ', '.join(args['target']),
@@ -615,10 +621,10 @@ class BaseBuildCommand(Command):
 
             result = subprocess.call([
                 'make',
-                '-j',
+                '-j' if threads is 0 else '-j%d' % threads,
                 '-Cbuild/',
                 'config=%s_linux' % (args['config']),
-                ] + pass_args + args['target'], shell=False)
+            ] + pass_args + args['target'], shell=False, env=dict(os.environ))
         print('')
         if result != 0:
             print('ERROR: build failed with one or more errors.')
@@ -718,14 +724,14 @@ class GenSpirvCommand(Command):
             # TODO(benvanik): remap?
 
             # bin2c so we get a header file we can compile in.
-            with open(h_file, 'wb') as out_file:
+            with open(h_file, 'w') as out_file:
                 out_file.write('// generated from `xb genspirv`\n')
                 out_file.write('// source: %s\n' % os.path.basename(src_file))
                 out_file.write('const uint8_t %s[] = {' % (identifier))
                 with open(spv_file, 'rb') as in_file:
                     index = 0
                     c = in_file.read(1)
-                    while c != '':
+                    while len(c) != 0:
                         if index % 12 == 0:
                             out_file.write('\n    ')
                         else:

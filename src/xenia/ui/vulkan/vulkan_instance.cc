@@ -2,7 +2,7 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2016 Ben Vanik. All rights reserved.                             *
+ * Copyright 2017 Ben Vanik. All rights reserved.                             *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
@@ -25,6 +25,10 @@
 #include "xenia/ui/vulkan/vulkan_immediate_drawer.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 #include "xenia/ui/window.h"
+
+#if XE_PLATFORM_LINUX
+#include "xenia/ui/window_gtk.h"
+#endif
 
 #define VK_API_VERSION VK_API_VERSION_1_0
 
@@ -65,7 +69,7 @@ VulkanInstance::VulkanInstance() {
 
 VulkanInstance::~VulkanInstance() { DestroyInstance(); }
 
-bool VulkanInstance::Initialize(Window* any_target_window) {
+bool VulkanInstance::Initialize() {
   auto version = Version::Parse(VK_API_VERSION);
   XELOGVK("Initializing Vulkan %s...", version.pretty_string.c_str());
 
@@ -83,7 +87,7 @@ bool VulkanInstance::Initialize(Window* any_target_window) {
   }
 
   // Query available devices so that we can pick one.
-  if (!QueryDevices(any_target_window)) {
+  if (!QueryDevices()) {
     XELOGE("Failed to query devices");
     return false;
   }
@@ -241,6 +245,9 @@ bool VulkanInstance::CreateInstance() {
   instance_info.ppEnabledExtensionNames = enabled_extensions.data();
 
   auto err = vkCreateInstance(&instance_info, nullptr, &handle);
+  if (err != VK_SUCCESS) {
+    XELOGE("vkCreateInstance returned %s", to_string(err));
+  }
   switch (err) {
     case VK_SUCCESS:
       // Ok!
@@ -343,7 +350,7 @@ void VulkanInstance::DisableDebugValidation() {
   dbg_report_callback_ = nullptr;
 }
 
-bool VulkanInstance::QueryDevices(Window* any_target_window) {
+bool VulkanInstance::QueryDevices() {
   // Get handles to all devices.
   uint32_t count = 0;
   std::vector<VkPhysicalDevice> device_handles;
@@ -371,33 +378,6 @@ bool VulkanInstance::QueryDevices(Window* any_target_window) {
     device_info.queue_family_properties.resize(count);
     vkGetPhysicalDeviceQueueFamilyProperties(
         device_handle, &count, device_info.queue_family_properties.data());
-
-    // Gather queue family presentation support.
-    // TODO(benvanik): move to swap chain?
-    VkSurfaceKHR any_surface = nullptr;
-#if XE_PLATFORM_WIN32
-    VkWin32SurfaceCreateInfoKHR create_info;
-    create_info.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
-    create_info.pNext = nullptr;
-    create_info.flags = 0;
-    create_info.hinstance =
-        static_cast<HINSTANCE>(any_target_window->native_platform_handle());
-    create_info.hwnd = static_cast<HWND>(any_target_window->native_handle());
-    err = vkCreateWin32SurfaceKHR(handle, &create_info, nullptr, &any_surface);
-    CheckResult(err, "vkCreateWin32SurfaceKHR");
-#else
-#error Platform not yet implemented.
-#endif  // XE_PLATFORM_WIN32
-    device_info.queue_family_supports_present.resize(
-        device_info.queue_family_properties.size());
-    for (size_t j = 0; j < device_info.queue_family_supports_present.size();
-         ++j) {
-      err = vkGetPhysicalDeviceSurfaceSupportKHR(
-          device_handle, static_cast<uint32_t>(j), any_surface,
-          &device_info.queue_family_supports_present[j]);
-      CheckResult(err, "vkGetPhysicalDeviceSurfaceSupportKHR");
-    }
-    vkDestroySurfaceKHR(handle, any_surface, nullptr);
 
     // Gather layers.
     std::vector<VkLayerProperties> layer_properties;
@@ -525,8 +505,6 @@ void VulkanInstance::DumpDeviceInfo(const DeviceInfo& device_info) {
                                                                : "");
     XELOGVK("    queueCount         = %u", queue_props.queueCount);
     XELOGVK("    timestampValidBits = %u", queue_props.timestampValidBits);
-    XELOGVK("    supportsPresent    = %s",
-            device_info.queue_family_supports_present[j] ? "true" : "false");
   }
 
   XELOGVK("  Layers:");

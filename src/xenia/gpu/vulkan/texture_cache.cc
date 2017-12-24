@@ -106,7 +106,7 @@ static const TextureConfig texture_configs[64] = {
     /* k_11_11_10_AS_16_16_16_16 */ {VK_FORMAT_B10G11R11_UFLOAT_PACK32},  // ?
     /* k_32_32_32_FLOAT         */ {VK_FORMAT_R32G32B32_SFLOAT},
     /* k_DXT3A                  */ {VK_FORMAT_UNDEFINED},
-    /* k_DXT5A                  */ {VK_FORMAT_UNDEFINED},
+    /* k_DXT5A                  */ {VK_FORMAT_UNDEFINED},  // ATI1N
 
     // http://fileadmin.cs.lth.se/cs/Personal/Michael_Doggett/talks/unc-xenos-doggett.pdf
     /* k_CTX1                   */ {VK_FORMAT_R8G8_UINT},
@@ -128,8 +128,12 @@ TextureCache::TextureCache(Memory* memory, RegisterFile* register_file,
       staging_buffer_(device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                       kStagingBufferSize),
       wb_staging_buffer_(device, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                         kStagingBufferSize) {
-  VkResult err = VK_SUCCESS;
+                         kStagingBufferSize) {}
+
+TextureCache::~TextureCache() { Shutdown(); }
+
+VkResult TextureCache::Initialize() {
+  VkResult status = VK_SUCCESS;
 
   // Descriptor pool used for all of our cached descriptors.
   VkDescriptorPoolSize pool_sizes[1];
@@ -176,42 +180,55 @@ TextureCache::TextureCache(Memory* memory, RegisterFile* register_file,
   descriptor_set_layout_info.bindingCount =
       static_cast<uint32_t>(xe::countof(bindings));
   descriptor_set_layout_info.pBindings = bindings;
-  err = vkCreateDescriptorSetLayout(*device_, &descriptor_set_layout_info,
-                                    nullptr, &texture_descriptor_set_layout_);
-  CheckResult(err, "vkCreateDescriptorSetLayout");
-
-  if (!staging_buffer_.Initialize()) {
-    assert_always();
+  status =
+      vkCreateDescriptorSetLayout(*device_, &descriptor_set_layout_info,
+                                  nullptr, &texture_descriptor_set_layout_);
+  if (status != VK_SUCCESS) {
+    return status;
   }
 
-  if (!wb_staging_buffer_.Initialize()) {
-    assert_always();
+  status = staging_buffer_.Initialize();
+  if (status != VK_SUCCESS) {
+    return status;
+  }
+
+  status = wb_staging_buffer_.Initialize();
+  if (status != VK_SUCCESS) {
+    return status;
   }
 
   // Create a memory allocator for textures.
   VmaAllocatorCreateInfo alloc_info = {
       0, *device_, *device_, 0, 0, nullptr, nullptr,
   };
-  err = vmaCreateAllocator(&alloc_info, &mem_allocator_);
-  CheckResult(err, "vmaCreateAllocator");
+  status = vmaCreateAllocator(&alloc_info, &mem_allocator_);
+  if (status != VK_SUCCESS) {
+    vkDestroyDescriptorSetLayout(*device_, texture_descriptor_set_layout_,
+                                 nullptr);
+    return status;
+  }
 
   invalidated_textures_sets_[0].reserve(64);
   invalidated_textures_sets_[1].reserve(64);
   invalidated_textures_ = &invalidated_textures_sets_[0];
 
-  device_queue_ = device_->AcquireQueue();
+  device_queue_ = device_->AcquireQueue(device_->queue_family_index());
+  return VK_SUCCESS;
 }
 
-TextureCache::~TextureCache() {
+void TextureCache::Shutdown() {
   if (device_queue_) {
-    device_->ReleaseQueue(device_queue_);
+    device_->ReleaseQueue(device_queue_, device_->queue_family_index());
   }
 
   // Free all textures allocated.
   ClearCache();
   Scavenge();
 
-  vmaDestroyAllocator(mem_allocator_);
+  if (mem_allocator_ != nullptr) {
+    vmaDestroyAllocator(mem_allocator_);
+    mem_allocator_ = nullptr;
+  }
   vkDestroyDescriptorSetLayout(*device_, texture_descriptor_set_layout_,
                                nullptr);
 }
@@ -249,10 +266,14 @@ TextureCache::TextureRegion* TextureCache::AllocateTextureRegion(
   if ((props.optimalTilingFeatures & required_flags) != required_flags) {
     // Texture needs conversion on upload to a native format.
     XELOGE(
-        "Texture Cache: Invalid usage flag specified on format %s (vk %d) "
-        "(0x%.8X != 0x%.8X)",
-        texture->texture_info.format_info()->name, texture->format,
-        (props.optimalTilingFeatures & required_flags), required_flags);
+        "Texture Cache: Invalid usage flag specified on format %s (%s)\n\t"
+        "(requested: %s)",
+        texture->texture_info.format_info()->name,
+        ui::vulkan::to_string(texture->format),
+        ui::vulkan::to_flags_string(
+            static_cast<VkFormatFeatureFlagBits>(required_flags &
+                                                 ~props.optimalTilingFeatures))
+            .c_str());
     assert_always();
   }
 
@@ -260,6 +281,10 @@ TextureCache::TextureRegion* TextureCache::AllocateTextureRegion(
       props.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
     // Add color attachment usage if it's supported.
     image_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  } else if (props.optimalTilingFeatures &
+             VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+    // Add depth/stencil usage as well.
+    image_info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
   }
 
   if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) {
@@ -286,15 +311,15 @@ TextureCache::TextureRegion* TextureCache::AllocateTextureRegion(
   VkImage image;
 
   VmaAllocation allocation;
-  VmaMemoryRequirements vma_reqs = {
-      0, VMA_MEMORY_USAGE_GPU_ONLY, 0, 0, nullptr,
+  VmaAllocationCreateInfo vma_create_info = {
+      0, VMA_MEMORY_USAGE_GPU_ONLY, 0, 0, 0, nullptr, nullptr,
   };
   VmaAllocationInfo vma_info = {};
-  VkResult status = vmaCreateImage(mem_allocator_, &image_info, &vma_reqs,
-                                   &image, &allocation, &vma_info);
+  VkResult status =
+      vmaCreateImage(mem_allocator_, &image_info, &vma_create_info, &image,
+                     &allocation, &vma_info);
   if (status != VK_SUCCESS) {
-    // Crap.
-    assert_always();
+    // Allocation failed.
     return nullptr;
   }
 
@@ -329,9 +354,7 @@ TextureCache::Texture* TextureCache::AllocateTexture(
   assert_not_null(texture->texture_info.format_info());
   auto& config =
       texture_configs[int(texture->texture_info.format_info()->format)];
-  texture->format = config.host_format != VK_FORMAT_UNDEFINED
-                        ? config.host_format
-                        : VK_FORMAT_R8G8B8A8_UNORM;
+  texture->format = config.host_format;
 
   TextureRegion* base_region = AllocateTextureRegion(
       texture, region_offset, region_extent, required_flags);
@@ -340,10 +363,12 @@ TextureCache::Texture* TextureCache::AllocateTexture(
 }
 
 bool TextureCache::FreeTexture(Texture* texture) {
-  if (texture->in_flight_fence &&
-      vkGetFenceStatus(*device_, texture->in_flight_fence) != VK_SUCCESS) {
-    // Texture still in flight.
-    return false;
+  if (texture->in_flight_fence) {
+    VkResult status = vkGetFenceStatus(*device_, texture->in_flight_fence);
+    if (status != VK_SUCCESS && status != VK_ERROR_DEVICE_LOST) {
+      // Texture still in flight.
+      return false;
+    }
   }
 
   if (texture->framebuffer) {
@@ -1176,8 +1201,12 @@ bool TextureCache::ConvertTexture(uint8_t* dest, VkBufferImageCopy* copy_region,
   switch (src.dimension) {
     case Dimension::k1D:
       assert_always();
+      break;
     case Dimension::k2D:
       return ConvertTexture2D(dest, copy_region, src);
+    case Dimension::k3D:
+      assert_always();
+      break;
     case Dimension::kCube:
       return ConvertTextureCube(dest, copy_region, src);
   }
@@ -1190,11 +1219,14 @@ bool TextureCache::ComputeTextureStorage(size_t* output_length,
     switch (src.dimension) {
       case Dimension::k1D: {
         assert_always();
-      }
+      } break;
       case Dimension::k2D: {
         *output_length = src.size_2d.input_width * src.size_2d.input_height * 2;
         return true;
       }
+      case Dimension::k3D: {
+        assert_always();
+      } break;
       case Dimension::kCube: {
         *output_length =
             src.size_cube.input_width * src.size_cube.input_height * 2 * 6;
@@ -1221,8 +1253,10 @@ void TextureCache::WritebackTexture(Texture* texture) {
   auto command_buffer = wb_command_pool_->AcquireEntry();
 
   VkCommandBufferBeginInfo begin_info = {
-      VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr,
-      VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr,
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      nullptr,
+      VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+      nullptr,
   };
   vkBeginCommandBuffer(command_buffer, &begin_info);
 
@@ -1369,7 +1403,7 @@ bool TextureCache::UploadTexture(VkCommandBuffer command_buffer,
   }
 
   vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr, 0,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
                        nullptr, 1, &barrier);
 
   // Now move the converted texture into the destination.
@@ -1385,9 +1419,10 @@ bool TextureCache::UploadTexture(VkCommandBuffer command_buffer,
   barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
   barrier.oldLayout = barrier.newLayout;
   barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr, 0,
-                       nullptr, 1, &barrier);
+  vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                       0, 0, nullptr, 0, nullptr, 1, &barrier);
 
   dest->base_region->image_layout = barrier.newLayout;
   return true;
@@ -1533,7 +1568,6 @@ bool TextureCache::SetupTextureBinding(VkCommandBuffer command_buffer,
   auto texture_region =
       DemandRegion(texture_info, command_buffer, completion_fence);
   auto sampler = Demand(sampler_info);
-  // assert_true(texture != nullptr && sampler != nullptr);
   if (texture_region == nullptr || sampler == nullptr) {
     return false;
   }

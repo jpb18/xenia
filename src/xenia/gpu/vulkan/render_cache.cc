@@ -223,7 +223,9 @@ CachedTileView::CachedTileView(ui::vulkan::VulkanDevice* device,
   image_view_info.format = image_info.format;
   // TODO(benvanik): manipulate? may not be able to when attached.
   image_view_info.components = {
-      VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B,
+      VK_COMPONENT_SWIZZLE_R,
+      VK_COMPONENT_SWIZZLE_G,
+      VK_COMPONENT_SWIZZLE_B,
       VK_COMPONENT_SWIZZLE_A,
   };
   image_view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -245,7 +247,7 @@ CachedTileView::CachedTileView(ui::vulkan::VulkanDevice* device,
 
     image_view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
     err = vkCreateImageView(device_, &image_view_info, nullptr,
-                            &image_view_depth);
+                            &image_view_stencil);
     CheckResult(err, "vkCreateImageView");
   }
 
@@ -271,8 +273,10 @@ CachedTileView::CachedTileView(ui::vulkan::VulkanDevice* device,
   image_barrier.subresourceRange.baseArrayLayer = 0;
   image_barrier.subresourceRange.layerCount = 1;
   vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, 0, nullptr, 0,
-                       nullptr, 1, &image_barrier);
+                       key.color_or_depth
+                           ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                           : VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+                       0, 0, nullptr, 0, nullptr, 1, &image_barrier);
 
   image_layout = image_barrier.newLayout;
 }
@@ -510,7 +514,11 @@ bool CachedRenderPass::IsCompatible(
 
 RenderCache::RenderCache(RegisterFile* register_file,
                          ui::vulkan::VulkanDevice* device)
-    : register_file_(register_file), device_(device) {
+    : register_file_(register_file), device_(device) {}
+
+RenderCache::~RenderCache() { Shutdown(); }
+
+VkResult RenderCache::Initialize() {
   VkResult status = VK_SUCCESS;
 
   // Create the buffer we'll bind to our memory.
@@ -524,8 +532,11 @@ RenderCache::RenderCache(RegisterFile* register_file,
   buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   buffer_info.queueFamilyIndexCount = 0;
   buffer_info.pQueueFamilyIndices = nullptr;
-  status = vkCreateBuffer(*device, &buffer_info, nullptr, &edram_buffer_);
+  status = vkCreateBuffer(*device_, &buffer_info, nullptr, &edram_buffer_);
   CheckResult(status, "vkCreateBuffer");
+  if (status != VK_SUCCESS) {
+    return status;
+  }
 
   // Query requirements for the buffer.
   // It should be 1:1.
@@ -535,19 +546,24 @@ RenderCache::RenderCache(RegisterFile* register_file,
 
   // Allocate EDRAM memory.
   // TODO(benvanik): do we need it host visible?
-  edram_memory_ = device->AllocateMemory(buffer_requirements);
+  edram_memory_ = device_->AllocateMemory(buffer_requirements);
   assert_not_null(edram_memory_);
+  if (!edram_memory_) {
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
 
   // Bind buffer to map our entire memory.
   status = vkBindBufferMemory(*device_, edram_buffer_, edram_memory_, 0);
   CheckResult(status, "vkBindBufferMemory");
+  if (status != VK_SUCCESS) {
+    return status;
+  }
 
   if (status == VK_SUCCESS) {
     // For debugging, upload a grid into the EDRAM buffer.
     uint32_t* gpu_data = nullptr;
     status = vkMapMemory(*device_, edram_memory_, 0, buffer_requirements.size,
                          0, reinterpret_cast<void**>(&gpu_data));
-    CheckResult(status, "vkMapMemory");
 
     if (status == VK_SUCCESS) {
       for (int i = 0; i < kEdramBufferCapacity / 4; i++) {
@@ -557,9 +573,11 @@ RenderCache::RenderCache(RegisterFile* register_file,
       vkUnmapMemory(*device_, edram_memory_);
     }
   }
+
+  return VK_SUCCESS;
 }
 
-RenderCache::~RenderCache() {
+void RenderCache::Shutdown() {
   // TODO(benvanik): wait for idle.
 
   // Dispose all render passes (and their framebuffers).
@@ -575,8 +593,14 @@ RenderCache::~RenderCache() {
   cached_tile_views_.clear();
 
   // Release underlying EDRAM memory.
-  vkDestroyBuffer(*device_, edram_buffer_, nullptr);
-  vkFreeMemory(*device_, edram_memory_, nullptr);
+  if (edram_buffer_) {
+    vkDestroyBuffer(*device_, edram_buffer_, nullptr);
+    edram_buffer_ = nullptr;
+  }
+  if (edram_memory_) {
+    vkFreeMemory(*device_, edram_memory_, nullptr);
+    edram_memory_ = nullptr;
+  }
 }
 
 bool RenderCache::dirty() const {
@@ -771,7 +795,9 @@ bool RenderCache::ParseConfiguration(RenderConfiguration* config) {
   // Color attachment configuration.
   if (config->mode_control == ModeControl::kColorDepth) {
     reg::RB_COLOR_INFO color_info[4] = {
-        regs.rb_color_info, regs.rb_color1_info, regs.rb_color2_info,
+        regs.rb_color_info,
+        regs.rb_color1_info,
+        regs.rb_color2_info,
         regs.rb_color3_info,
     };
     for (int i = 0; i < 4; ++i) {
@@ -788,6 +814,9 @@ bool RenderCache::ParseConfiguration(RenderConfiguration* config) {
           break;
         case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_unknown:
           config->color[i].format = ColorRenderTargetFormat::k_2_10_10_10_FLOAT;
+          break;
+        default:
+          // The rest are good
           break;
       }
     }
@@ -870,7 +899,7 @@ bool RenderCache::ConfigureRenderPass(VkCommandBuffer command_buffer,
       color_key.edram_format = static_cast<uint16_t>(config->color[i].format);
       target_color_attachments[i] =
           FindOrCreateTileView(command_buffer, color_key);
-      if (!target_color_attachments) {
+      if (!target_color_attachments[i]) {
         XELOGE("Failed to get tile view for color attachment");
         return false;
       }
@@ -932,6 +961,9 @@ CachedTileView* RenderCache::FindTileView(uint32_t base, uint32_t pitch,
         break;
       case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_unknown:
         format = uint32_t(ColorRenderTargetFormat::k_2_10_10_10_FLOAT);
+        break;
+      default:
+        // Other types as-is.
         break;
     }
   }
@@ -1172,6 +1204,9 @@ void RenderCache::BlitToImage(VkCommandBuffer command_buffer,
       case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_unknown:
         format = uint32_t(ColorRenderTargetFormat::k_2_10_10_10_FLOAT);
         break;
+      default:
+        // Rest are OK
+        break;
     }
   }
 
@@ -1284,6 +1319,9 @@ void RenderCache::ClearEDRAMColor(VkCommandBuffer command_buffer,
       break;
     case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_unknown:
       format = ColorRenderTargetFormat::k_2_10_10_10_FLOAT;
+      break;
+    default:
+      // Rest are OK
       break;
   }
 

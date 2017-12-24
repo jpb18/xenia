@@ -2,7 +2,7 @@
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
  ******************************************************************************
- * Copyright 2016 Ben Vanik. All rights reserved.                             *
+ * Copyright 2017 Ben Vanik. All rights reserved.                             *
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  */
@@ -13,12 +13,14 @@
 
 #include <cfloat>
 #include <cstring>
+#include <vector>
 
 #include "xenia/base/logging.h"
 #include "xenia/gpu/spirv/passes/control_flow_analysis_pass.h"
 #include "xenia/gpu/spirv/passes/control_flow_simplification_pass.h"
 
 DEFINE_bool(spv_validate, false, "Validate SPIR-V shaders after generation");
+DEFINE_bool(spv_disasm, false, "Disassemble SPIR-V shaders after generation");
 
 namespace xe {
 namespace gpu {
@@ -100,6 +102,8 @@ void SpirvShaderTranslator::StartTranslation() {
   aL_ = b.createVariable(spv::StorageClass::StorageClassFunction,
                          vec4_uint_type_, "aL");
 
+  loop_count_ = b.createVariable(spv::StorageClass::StorageClassFunction,
+                                 vec4_uint_type_, "loop_count");
   p0_ = b.createVariable(spv::StorageClass::StorageClassFunction, bool_type_,
                          "p0");
   ps_ = b.createVariable(spv::StorageClass::StorageClassFunction, float_type_,
@@ -337,8 +341,7 @@ void SpirvShaderTranslator::StartTranslation() {
                                       registers_ptr_,
                                       std::vector<Id>({b.makeUintConstant(0)}));
     auto r0 = b.createLoad(r0_ptr);
-    r0 = b.createCompositeInsert(vertex_idx, r0, vec4_float_type_,
-                                 std::vector<uint32_t>({0}));
+    r0 = b.createCompositeInsert(vertex_idx, r0, vec4_float_type_, 0);
     b.createStore(r0, r0_ptr);
   } else {
     // Pixel inputs from vertex shader.
@@ -367,6 +370,14 @@ void SpirvShaderTranslator::StartTranslation() {
     interface_ids_.push_back(frag_outputs_);
     interface_ids_.push_back(frag_depth_);
     // TODO(benvanik): frag depth, etc.
+
+    // TODO(DrChat): Verify this naive, stupid approach to uninitialized values.
+    for (uint32_t i = 0; i < 4; i++) {
+      auto idx = b.makeUintConstant(i);
+      auto oC = b.createAccessChain(spv::StorageClass::StorageClassOutput,
+                                    frag_outputs_, std::vector<Id>({idx}));
+      b.createStore(vec4_float_zero_, oC);
+    }
 
     // Copy interpolators to r[0..16].
     // TODO: Need physical addressing in order to do this.
@@ -637,14 +648,16 @@ void SpirvShaderTranslator::PostTranslation(Shader* shader) {
     }
   }
 
-  // TODO(benvanik): only if needed? could be slowish.
-  auto disasm = disassembler_.Disassemble(
-      reinterpret_cast<const uint32_t*>(shader->translated_binary().data()),
-      shader->translated_binary().size() / 4);
-  if (disasm->has_error()) {
-    XELOGE("Failed to disassemble SPIRV - invalid?");
-  } else {
-    set_host_disassembly(shader, disasm->to_string());
+  if (FLAGS_spv_disasm) {
+    // TODO(benvanik): only if needed? could be slowish.
+    auto disasm = disassembler_.Disassemble(
+        reinterpret_cast<const uint32_t*>(shader->translated_binary().data()),
+        shader->translated_binary().size() / 4);
+    if (disasm->has_error()) {
+      XELOGE("Failed to disassemble SPIRV - invalid?");
+    } else {
+      set_host_disassembly(shader, disasm->to_string());
+    }
   }
 }
 
@@ -686,30 +699,47 @@ void SpirvShaderTranslator::PreProcessControlFlowInstructions(
     auto& instr = instrs[i];
     if (instr.opcode() == ucode::ControlFlowOpcode::kCondJmp) {
       uint32_t address = instr.cond_jmp.address();
-      cf_blocks_[address].labelled = true;
 
-      operands.push_back(address);
-      operands.push_back(cf_blocks_[address].block->getId());
-      cf_blocks_[address].block->addPredecessor(loop_body_block_);
+      if (!cf_blocks_[address].labelled) {
+        cf_blocks_[address].labelled = true;
+        operands.push_back(address);
+        operands.push_back(cf_blocks_[address].block->getId());
+        cf_blocks_[address].block->addPredecessor(loop_body_block_);
+      }
 
-      cf_blocks_[i + 1].labelled = true;
-      operands.push_back(uint32_t(i + 1));
-      operands.push_back(cf_blocks_[i + 1].block->getId());
-      cf_blocks_[i + 1].block->addPredecessor(loop_body_block_);
+      if (!cf_blocks_[i + 1].labelled) {
+        cf_blocks_[i + 1].labelled = true;
+        operands.push_back(uint32_t(i + 1));
+        operands.push_back(cf_blocks_[i + 1].block->getId());
+        cf_blocks_[i + 1].block->addPredecessor(loop_body_block_);
+      }
     } else if (instr.opcode() == ucode::ControlFlowOpcode::kLoopStart) {
       uint32_t address = instr.loop_start.address();
-      cf_blocks_[address].labelled = true;
 
-      operands.push_back(address);
-      operands.push_back(cf_blocks_[address].block->getId());
-      cf_blocks_[address].block->addPredecessor(loop_body_block_);
+      // Label the loop skip address.
+      if (!cf_blocks_[address].labelled) {
+        cf_blocks_[address].labelled = true;
+        operands.push_back(address);
+        operands.push_back(cf_blocks_[address].block->getId());
+        cf_blocks_[address].block->addPredecessor(loop_body_block_);
+      }
+
+      // Label the body
+      if (!cf_blocks_[i + 1].labelled) {
+        cf_blocks_[i + 1].labelled = true;
+        operands.push_back(uint32_t(i + 1));
+        operands.push_back(cf_blocks_[i + 1].block->getId());
+        cf_blocks_[i + 1].block->addPredecessor(loop_body_block_);
+      }
     } else if (instr.opcode() == ucode::ControlFlowOpcode::kLoopEnd) {
       uint32_t address = instr.loop_end.address();
-      cf_blocks_[address].labelled = true;
 
-      operands.push_back(address);
-      operands.push_back(cf_blocks_[address].block->getId());
-      cf_blocks_[address].block->addPredecessor(loop_body_block_);
+      if (!cf_blocks_[address].labelled) {
+        cf_blocks_[address].labelled = true;
+        operands.push_back(address);
+        operands.push_back(cf_blocks_[address].block->getId());
+        cf_blocks_[address].block->addPredecessor(loop_body_block_);
+      }
     }
   }
 
@@ -862,13 +892,52 @@ void SpirvShaderTranslator::ProcessLoopStartInstruction(
   auto head = cf_blocks_[instr.dword_index].block;
   b.setBuildPoint(head);
 
-  // TODO: Emit a spv LoopMerge
-  // (need to know the continue target and merge target beforehand though)
+  // loop il<idx>, L<idx> - loop with loop data il<idx>, end @ L<idx>
 
-  EmitUnimplementedTranslationError();
+  std::vector<Id> offsets;
+  offsets.push_back(b.makeUintConstant(1));  // loop_consts
+  offsets.push_back(b.makeUintConstant(instr.loop_constant_index));
+  auto loop_const = b.createAccessChain(spv::StorageClass::StorageClassUniform,
+                                        consts_, offsets);
+  loop_const = b.createLoad(loop_const);
 
-  assert_true(cf_blocks_.size() > instr.dword_index + 1);
-  b.createBranch(cf_blocks_[instr.dword_index + 1].block);
+  // uint loop_count_value = loop_const & 0xFF;
+  auto loop_count_value = b.createBinOp(spv::Op::OpBitwiseAnd, uint_type_,
+                                        loop_const, b.makeUintConstant(0xFF));
+
+  // uint loop_aL_value = (loop_const >> 8) & 0xFF;
+  auto loop_aL_value = b.createBinOp(spv::Op::OpShiftRightLogical, uint_type_,
+                                     loop_const, b.makeUintConstant(8));
+  loop_aL_value = b.createBinOp(spv::Op::OpBitwiseAnd, uint_type_,
+                                loop_aL_value, b.makeUintConstant(0xFF));
+
+  // loop_count_ = uvec4(loop_count_value, loop_count_.xyz);
+  auto loop_count = b.createLoad(loop_count_);
+  loop_count =
+      b.createRvalueSwizzle(spv::NoPrecision, vec4_uint_type_, loop_count,
+                            std::vector<uint32_t>({0, 0, 1, 2}));
+  loop_count =
+      b.createCompositeInsert(loop_count_value, loop_count, vec4_uint_type_, 0);
+  b.createStore(loop_count, loop_count_);
+
+  // aL = aL.xxyz;
+  auto aL = b.createLoad(aL_);
+  aL = b.createRvalueSwizzle(spv::NoPrecision, vec4_uint_type_, aL,
+                             std::vector<uint32_t>({0, 0, 1, 2}));
+  if (!instr.is_repeat) {
+    // aL.x = loop_aL_value;
+    aL = b.createCompositeInsert(loop_aL_value, aL, vec4_uint_type_, 0);
+  }
+  b.createStore(aL, aL_);
+
+  // Short-circuit if loop counter is 0
+  auto cond = b.createBinOp(spv::Op::OpIEqual, bool_type_, loop_count_value,
+                            b.makeUintConstant(0));
+  auto next_pc = b.createTriOp(spv::Op::OpSelect, int_type_, cond,
+                               b.makeIntConstant(instr.loop_skip_address),
+                               b.makeIntConstant(instr.dword_index + 1));
+  b.createStore(next_pc, pc_);
+  b.createBranch(switch_break_block_);
 }
 
 void SpirvShaderTranslator::ProcessLoopEndInstruction(
@@ -878,10 +947,83 @@ void SpirvShaderTranslator::ProcessLoopEndInstruction(
   auto head = cf_blocks_[instr.dword_index].block;
   b.setBuildPoint(head);
 
-  EmitUnimplementedTranslationError();
+  // endloop il<idx>, L<idx> - end loop w/ data il<idx>, head @ L<idx>
+  auto loop_count = b.createLoad(loop_count_);
+  auto count = b.createCompositeExtract(loop_count, uint_type_, 0);
+  count =
+      b.createBinOp(spv::Op::OpISub, uint_type_, count, b.makeUintConstant(1));
+  loop_count = b.createCompositeInsert(count, loop_count, vec4_uint_type_, 0);
+  b.createStore(loop_count, loop_count_);
 
-  assert_true(cf_blocks_.size() > instr.dword_index + 1);
-  b.createBranch(cf_blocks_[instr.dword_index + 1].block);
+  // if (--loop_count_.x == 0 || [!]p0)
+  auto c1 = b.createBinOp(spv::Op::OpIEqual, bool_type_, count,
+                          b.makeUintConstant(0));
+  auto c2 =
+      b.createBinOp(spv::Op::OpLogicalEqual, bool_type_, b.createLoad(p0_),
+                    b.makeBoolConstant(instr.predicate_condition));
+  auto cond = b.createBinOp(spv::Op::OpLogicalOr, bool_type_, c1, c2);
+
+  auto loop = &b.makeNewBlock();
+  auto end = &b.makeNewBlock();
+  auto tail = &b.makeNewBlock();
+  b.createSelectionMerge(tail, spv::SelectionControlMaskNone);
+  b.createConditionalBranch(cond, end, loop);
+
+  // ================================================
+  // Loop completed - pop the current loop off the stack and exit
+  b.setBuildPoint(end);
+  loop_count = b.createLoad(loop_count_);
+  auto aL = b.createLoad(aL_);
+
+  // loop_count = loop_count.yzw0
+  loop_count =
+      b.createRvalueSwizzle(spv::NoPrecision, vec4_uint_type_, loop_count,
+                            std::vector<uint32_t>({1, 2, 3, 3}));
+  loop_count = b.createCompositeInsert(b.makeUintConstant(0), loop_count,
+                                       vec4_uint_type_, 3);
+  b.createStore(loop_count, loop_count_);
+
+  // aL = aL.yzw0
+  aL = b.createRvalueSwizzle(spv::NoPrecision, vec4_uint_type_, aL,
+                             std::vector<uint32_t>({1, 2, 3, 3}));
+  aL = b.createCompositeInsert(b.makeUintConstant(0), aL, vec4_uint_type_, 3);
+  b.createStore(aL, aL_);
+
+  // Update pc with the next block
+  // pc_ = instr.dword_index + 1
+  b.createStore(b.makeIntConstant(instr.dword_index + 1), pc_);
+  b.createBranch(tail);
+
+  // ================================================
+  // Still looping - increment aL and loop
+  b.setBuildPoint(loop);
+  aL = b.createLoad(aL_);
+  auto aL_x = b.createCompositeExtract(aL, uint_type_, 0);
+
+  std::vector<Id> offsets;
+  offsets.push_back(b.makeUintConstant(1));  // loop_consts
+  offsets.push_back(b.makeUintConstant(instr.loop_constant_index));
+  auto loop_const = b.createAccessChain(spv::StorageClass::StorageClassUniform,
+                                        consts_, offsets);
+  loop_const = b.createLoad(loop_const);
+
+  // uint loop_aL_value = (loop_const >> 16) & 0xFF;
+  auto loop_aL_value = b.createBinOp(spv::Op::OpShiftRightLogical, uint_type_,
+                                     loop_const, b.makeUintConstant(16));
+  loop_aL_value = b.createBinOp(spv::Op::OpBitwiseAnd, uint_type_,
+                                loop_aL_value, b.makeUintConstant(0xFF));
+
+  aL_x = b.createBinOp(spv::Op::OpIAdd, uint_type_, aL_x, loop_aL_value);
+  aL = b.createCompositeInsert(aL_x, aL, vec4_uint_type_, 0);
+  b.createStore(aL, aL_);
+
+  // pc_ = instr.loop_body_address;
+  b.createStore(b.makeIntConstant(instr.loop_body_address), pc_);
+  b.createBranch(tail);
+
+  // ================================================
+  b.setBuildPoint(tail);
+  b.createBranch(switch_break_block_);
 }
 
 void SpirvShaderTranslator::ProcessCallInstruction(
@@ -1323,14 +1465,29 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         params.sampler = image;
         params.lod = b.makeIntConstant(0);
         size = b.createTextureQueryCall(spv::Op::OpImageQuerySizeLod, params);
+
+        if (instr.dimension == TextureDimension::k1D) {
+          size = b.createUnaryOp(spv::Op::OpConvertSToF, float_type_, size);
+        } else if (instr.dimension == TextureDimension::k2D) {
+          size =
+              b.createUnaryOp(spv::Op::OpConvertSToF, vec2_float_type_, size);
+        } else if (instr.dimension == TextureDimension::k3D) {
+          size =
+              b.createUnaryOp(spv::Op::OpConvertSToF, vec3_float_type_, size);
+        } else if (instr.dimension == TextureDimension::kCube) {
+          size =
+              b.createUnaryOp(spv::Op::OpConvertSToF, vec4_float_type_, size);
+        }
       }
 
       if (instr.dimension == TextureDimension::k1D) {
+        src = b.createCompositeExtract(src, float_type_, 0);
         if (instr.attributes.offset_x) {
           auto offset = b.makeFloatConstant(instr.attributes.offset_x + 0.5f);
           offset = b.createBinOp(spv::Op::OpFDiv, float_type_, offset, size);
           src = b.createBinOp(spv::Op::OpFAdd, float_type_, src, offset);
         }
+
         // https://msdn.microsoft.com/en-us/library/windows/desktop/bb944006.aspx
         // "Because the runtime does not support 1D textures, the compiler will
         //  use a 2D texture with the knowledge that the y-coordinate is
@@ -1339,6 +1496,8 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             vec2_float_type_,
             std::vector<Id>({src, b.makeFloatConstant(0.0f)}));
       } else if (instr.dimension == TextureDimension::k2D) {
+        src = b.createRvalueSwizzle(spv::NoPrecision, vec2_float_type_, src,
+                                    std::vector<uint32_t>({0, 1}));
         if (instr.attributes.offset_x || instr.attributes.offset_y) {
           auto offset = b.makeCompositeConstant(
               vec2_float_type_,
@@ -2309,7 +2468,7 @@ void SpirvShaderTranslator::ProcessScalarAluInstruction(
 
     case AluScalarOpcode::kRcp: {
       // dest = src0 != 0.0 ? 1.0 / src0 : 0.0;
-      auto c = b.createBinOp(spv::Op::OpFOrdEqual, float_type_, sources[0],
+      auto c = b.createBinOp(spv::Op::OpFOrdEqual, bool_type_, sources[0],
                              b.makeFloatConstant(0.f));
       auto d = b.createBinOp(spv::Op::OpFDiv, float_type_,
                              b.makeFloatConstant(1.f), sources[0]);
@@ -2554,10 +2713,10 @@ Id SpirvShaderTranslator::LoadFromOperand(const InstructionOperand& op) {
                         b.makeUintConstant(storage_base + op.storage_index));
     } break;
     case InstructionStorageAddressingMode::kAddressRelative: {
-      // TODO: Based on loop index
       // storage_index + aL.x
+      auto idx = b.createCompositeExtract(b.createLoad(aL_), uint_type_, 0);
       storage_index =
-          b.createBinOp(spv::Op::OpIAdd, uint_type_, b.makeUintConstant(0),
+          b.createBinOp(spv::Op::OpIAdd, uint_type_, idx,
                         b.makeUintConstant(storage_base + op.storage_index));
     } break;
     default:
@@ -2713,7 +2872,9 @@ void SpirvShaderTranslator::StoreToResult(Id source_value_id,
     } break;
     case InstructionStorageAddressingMode::kAddressRelative: {
       // storage_index + aL.x
-      // TODO
+      auto idx = b.createCompositeExtract(b.createLoad(aL_), uint_type_, 0);
+      storage_index = b.createBinOp(spv::Op::OpIAdd, uint_type_, idx,
+                                    b.makeUintConstant(result.storage_index));
     } break;
     default:
       assert_always();

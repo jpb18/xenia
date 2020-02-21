@@ -55,19 +55,13 @@ thread_local std::vector<char> log_format_buffer_(64 * 1024);
 class Logger {
  public:
   explicit Logger(const std::wstring& app_name) : running_(true) {
-    if (cvars::log_file.empty()) {
-      // Default to app name.
-      auto file_path = app_name + L".log";
+    if (!cvars::log_file.empty() && cvars::log_file == "stdout") {
+      file_ = stdout;
+    } else {
+      this->app_name = app_name;
+      auto file_path = CreateNewFileName(app_name);
       xe::filesystem::CreateParentFolder(file_path);
       file_ = xe::filesystem::OpenFile(file_path, "wt");
-    } else {
-      if (cvars::log_file == "stdout") {
-        file_ = stdout;
-      } else {
-        auto file_path = xe::to_wstring(cvars::log_file);
-        xe::filesystem::CreateParentFolder(file_path);
-        file_ = xe::filesystem::OpenFile(file_path, "wt");
-      }
     }
 
     write_thread_ =
@@ -137,6 +131,7 @@ class Logger {
 
  private:
   static const size_t kBufferSize = 8 * 1024 * 1024;
+  static const size_t maxFileSize = 1024 * 1024 * 20;
 
   struct LogLine {
     size_t buffer_length;
@@ -148,7 +143,7 @@ class Logger {
 
   void Write(const char* buf, size_t size) {
     if (file_) {
-      fwrite(buf, 1, size, file_);
+      fwrite(buf, 1, size, file_); 
     }
 
     if (cvars::log_to_debugprint) {
@@ -189,15 +184,20 @@ class Logger {
         std::snprintf(prefix + 3, sizeof(prefix) - 3, "%08" PRIX32 " ",
                       line.thread_id);
         Write(prefix, sizeof(prefix) - 1);
+        if (file_ != stdout) bytes_wrote_ += sizeof(prefix - 1);
+
         if (line.buffer_length) {
           // Get access to the line data - which may be split in the ring buffer
           // - and write it out in parts.
           auto line_range = rb.BeginRead(line.buffer_length);
           Write(reinterpret_cast<const char*>(line_range.first),
                 line_range.first_length);
+          if (file_ != stdout) bytes_wrote_ += line_range.first_length;
+
           if (line_range.second_length) {
             Write(reinterpret_cast<const char*>(line_range.second),
                   line_range.second_length);
+            if (file_ != stdout) bytes_wrote_ += line_range.second_length;
           }
           // Always ensure there is a newline.
           char last_char = line_range.second
@@ -206,6 +206,7 @@ class Logger {
           if (last_char != '\n') {
             const char suffix[1] = {'\n'};
             Write(suffix, 1);
+            if (file_ != stdout) bytes_wrote_++;
           }
           rb.EndRead(std::move(line_range));
         } else {
@@ -219,6 +220,20 @@ class Logger {
       if (did_write) {
         if (cvars::flush_log) {
           fflush(file_);
+        }
+
+        // if file is not stdout and has exceded maxFileSize
+        if (file_ != stdout && bytes_wrote_ >= maxFileSize) {
+          // close previous file
+          fflush(file_);
+          fclose(file_);
+
+          // create new file
+          auto file_path = CreateNewFileName(this->app_name);
+          xe::filesystem::CreateParentFolder(file_path);
+          file_ = xe::filesystem::OpenFile(file_path, "wt");
+
+          bytes_wrote_ = 0;
         }
 
         idle_loops = 0;
@@ -238,6 +253,8 @@ class Logger {
   size_t read_head_ = 0;
   uint8_t buffer_[kBufferSize];
   FILE* file_ = nullptr;
+  volatile size_t bytes_wrote_ = 0;
+  std::wstring app_name;
 
   std::atomic<bool> running_;
   std::unique_ptr<xe::threading::Thread> write_thread_;
@@ -353,6 +370,31 @@ void FatalError(const wchar_t* fmt, ...) {
 #endif  // WIN32
   ShutdownLogging();
   std::exit(1);
+}
+
+std::wstring CreateNewFileName(const std::wstring& app_name) {
+  std::wstring file_path;
+  std::wstring datetime_str = CurrentDateTimeString();
+  if (cvars::log_file.empty()) {
+    file_path = app_name + L"_" + datetime_str + L".log";
+  } else {
+    file_path = xe::to_wstring(cvars::log_file) + L"_" + datetime_str + L".log";
+  }
+  return file_path;
+}
+
+std::wstring CurrentDateTimeString() { 
+  time_t now = time(0);
+  tm* ltm = localtime(&now);
+
+  char buff[15];
+  strftime(buff, sizeof(buff), "%Y%m%d%H%M%S", ltm);
+
+  return to_wstring(buff);
+}
+
+void SwapLogFile() {
+
 }
 
 void FatalError(const std::string& str) { FatalError(str.c_str()); }

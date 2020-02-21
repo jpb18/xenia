@@ -55,6 +55,11 @@ void FatalError(const wchar_t* fmt, ...);
 void FatalError(const std::string& str);
 void FatalError(const std::wstring& str);
 
+// Creates a new file name with a timestamp appended at the end
+std::wstring CreateNewFileName(const std::wstring& app_name);
+// Creates a DateTime string with the following format: %Y%m%d%H%M%S
+std::wstring CurrentDateTimeString();
+
 #if XE_OPTION_ENABLE_LOGGING
 #define XELOGCORE(level, prefix, fmt, ...) \
   xe::LogLineFormat(level, prefix, fmt, ##__VA_ARGS__)
